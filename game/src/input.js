@@ -1,49 +1,58 @@
-// Keyboard and mouse, and the pointer lock that turns the mouse into look. Plain browser
-// APIs only: the game asks the canvas for pointer lock and reads movementX/Y while it holds it.
-export function createInput(canvas, onLockChange) {
+// Input is deliberately thin: key set, pointer lock, and the handful of edge-triggered keys the
+// game cares about (reload, plant, buy, scoreboard, weapon slots).
+export function createInput({ canvas, onKey, onMouseMove, onMouseDown, onMouseUp, onLockChange }) {
   const keys = new Set();
-  const state = { keys, locked: false, firing: false, lookX: 0, lookY: 0 };
+  const locked = { value: false };
 
-  function setKey(event, down) {
-    if (down) keys.add(event.code);
-    else keys.delete(event.code);
-    if (event.code === 'Space') event.preventDefault();
+  function keyName(event) {
+    return event.code || event.key;
   }
 
-  window.addEventListener('keydown', (event) => setKey(event, true));
-  window.addEventListener('keyup', (event) => setKey(event, false));
-  window.addEventListener('blur', () => keys.clear());
-  window.addEventListener('mousemove', (event) => {
-    if (!state.locked) return;
-    state.lookX += event.movementX;
-    state.lookY += event.movementY;
-  });
-  window.addEventListener('mousedown', (event) => {
-    if (state.locked && event.button === 0) state.firing = true;
-  });
-  window.addEventListener('mouseup', (event) => {
-    if (event.button === 0) state.firing = false;
-  });
-  document.addEventListener('pointerlockchange', () => {
-    state.locked = document.pointerLockElement === canvas;
-    if (!state.locked) {
-      keys.clear();
-      state.firing = false;
-    }
-    onLockChange(state.locked);
+  window.addEventListener('keydown', (event) => {
+    const code = keyName(event);
+    if (['Tab', 'Space', 'KeyB', 'KeyE', 'Digit1', 'Digit2', 'Digit3', 'KeyR', 'KeyC'].includes(code)) event.preventDefault();
+    if (!keys.has(code)) onKey?.(code, { first: true, event });
+    keys.add(code);
   });
 
-  return {
-    state,
-    requestLock() {
-      canvas.requestPointerLock();
-    },
-    takeLook() {
-      const x = state.lookX;
-      const y = state.lookY;
-      state.lookX = 0;
-      state.lookY = 0;
-      return { x, y };
-    },
-  };
+  window.addEventListener('keyup', (event) => {
+    const code = keyName(event);
+    keys.delete(code);
+    onKey?.(code, { first: false, event });
+  });
+
+  window.addEventListener('mousemove', (event) => {
+    if (!locked.value) return;
+    onMouseMove?.(event.movementX || 0, event.movementY || 0);
+  });
+
+  canvas.addEventListener('mousedown', (event) => {
+    if (event.button === 0) onMouseDown?.(event);
+  });
+
+  window.addEventListener('mouseup', (event) => {
+    if (event.button === 0) onMouseUp?.(event);
+  });
+
+  document.addEventListener('pointerlockchange', () => {
+    locked.value = document.pointerLockElement === canvas;
+    onLockChange?.(locked.value);
+  });
+
+  function requestLock() {
+    if (document.pointerLockElement === canvas) return;
+    try {
+      const pending = canvas.requestPointerLock?.();
+      // a browser refuses a lock asked for outside a click; that is not an error worth showing
+      if (pending && typeof pending.catch === 'function') pending.catch(() => {});
+    } catch {
+      /* refused: the overlay's Play button asks again on the next click */
+    }
+  }
+
+  function exitLock() {
+    if (document.pointerLockElement === canvas) document.exitPointerLock?.();
+  }
+
+  return { keys, locked, requestLock, exitLock, has: (code) => keys.has(code) };
 }

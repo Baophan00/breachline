@@ -1,123 +1,251 @@
-// Player movement: acceleration, friction, gravity, crouch and jump, resolved as a box against
-// the world's colliders one axis at a time, so a wall never swallows the player.
+// The player: quake-flavoured movement with friction and air control, a camera with view punch,
+// and a weapon state machine that keeps the rate of fire, the reload and the spread honest.
 import * as THREE from 'three';
+import { PLAYER, WEAPONS } from './config.js';
+import { moveActor, updateActorMesh } from './actor.js';
 
-const RADIUS = 0.34;
-const STAND_HEIGHT = 1.72;
-const CROUCH_HEIGHT = 1.12;
-const STAND_EYE = 1.6;
-const CROUCH_EYE = 1.02;
-const WALK_SPEED = 5.2;
-const CROUCH_SPEED = 2.4;
-const GROUND_ACCEL = 42;
-const AIR_ACCEL = 9;
-const FRICTION = 9;
-const GRAVITY = 20;
-const JUMP_SPEED = 6.2;
+export function createPlayer({ camera, combat, audio, hud, onShot, onReload, onSwitch }) {
+  const keys = new Set();
+  const pressed = new Set();
+  let mouseDown = false;
+  let bob = 0;
+  let shake = 0;
+  let viewPunch = { x: 0, y: 0 };
+  let weaponState = { id: 'sidearm', mag: WEAPONS.sidearm.mag, reserve: WEAPONS.sidearm.reserve, cooldown: 0, reload: 0 };
+  let recoilIndex = 0;
+  let lastShotAt = 0;
+  let scoped = false;
 
-export function createPlayer(colliders) {
-  const player = {
-    position: new THREE.Vector3(0, 0, 9.5),
-    velocity: new THREE.Vector3(),
-    yaw: 0,
+  const state = {
+    yaw: Math.PI,
     pitch: 0,
-    eye: STAND_EYE,
-    onGround: true,
-    crouching: false,
-    height: STAND_HEIGHT,
+    moving: 0,
+    firing: false,
+    reloading: false,
+    weaponId: 'sidearm',
   };
-  const probe = new THREE.Box3();
-  const wish = new THREE.Vector3();
 
-  // lift keeps the feet and the crown out of the horizontal tests, so standing on the floor
-  // is not read as walking into a wall.
-  function overlaps(x, y, z, height, lift) {
-    probe.min.set(x - RADIUS, y + lift, z - RADIUS);
-    probe.max.set(x + RADIUS, y + height - lift, z + RADIUS);
-    for (const collider of colliders) if (probe.intersectsBox(collider)) return collider;
-    return null;
+  function resetWeapon(id) {
+    const def = WEAPONS[id];
+    weaponState = { id, mag: def.mag, reserve: def.reserve, cooldown: 0, reload: 0 };
+    state.weaponId = id;
+    hud?.setWeapon(def);
+    onSwitch?.(def);
   }
 
-  function look(dx, dy, sensitivity = 0.0022) {
-    player.yaw -= dx * sensitivity;
-    player.pitch = Math.max(-1.45, Math.min(1.45, player.pitch - dy * sensitivity));
+  function giveWeapon(id, actorMoney) {
+    const def = WEAPONS[id];
+    if (!def) return false;
+    resetWeapon(id);
+    return true;
   }
 
-  function recoil(pitchKick, yawKick) {
-    player.pitch = Math.min(1.45, player.pitch + pitchKick);
-    player.yaw += yawKick;
-  }
-
-  function step(dt, keys) {
-    const crouching = keys.has('ControlLeft') || keys.has('ControlRight') || keys.has('KeyC');
-    if (crouching && !player.crouching) {
-      player.crouching = true;
-      player.height = CROUCH_HEIGHT;
-    } else if (!crouching && player.crouching && !overlaps(player.position.x, player.position.y, player.position.z, STAND_HEIGHT, 0.02)) {
-      player.crouching = false;
-      player.height = STAND_HEIGHT;
+  function addAmmo() {
+    for (const w of ['sidearm', 'rifle', 'smg', 'shotgun']) {
+      if (weaponState.id === w) {
+        weaponState.reserve = WEAPONS[w].reserve;
+      }
     }
-    const eyeTarget = player.crouching ? CROUCH_EYE : STAND_EYE;
-    player.eye += (eyeTarget - player.eye) * Math.min(1, dt * 12);
+  }
+
+  function canFire(actor, now) {
+    const def = WEAPONS[weaponState.id];
+    if (weaponState.reload > 0) return false;
+    if (weaponState.mag <= 0) return false;
+    if (now < weaponState.cooldown) return false;
+    return true;
+  }
+
+  function currentSpread(actor) {
+    const def = WEAPONS[weaponState.id];
+    const speed = Math.hypot(actor.vx, actor.vz);
+    const movement = Math.min(1, speed / PLAYER.walkSpeed);
+    const crouchFactor = actor.crouch ? 0.6 : 1;
+    const airFactor = actor.onGround ? 1 : 2.6;
+    return (def.spread + def.moveSpread * movement * airFactor) * crouchFactor;
+  }
+
+  function startReload(actor) {
+    const def = WEAPONS[weaponState.id];
+    if (weaponState.reload > 0 || weaponState.mag === def.mag || weaponState.reserve <= 0) return;
+    weaponState.reload = def.reload;
+    state.reloading = true;
+    audio?.play('reload');
+    onReload?.(def);
+  }
+
+  function switchWeapon(actor, slot) {
+    const wanted = Object.values(WEAPONS).find((w) => w.slot === slot && w.id !== 'knife');
+    if (!wanted) return;
+    if (wanted.price > 0 && !actor.ownedWeapons?.has(wanted.id)) return;
+    if (weaponState.id === wanted.id) return;
+    resetWeapon(wanted.id);
+  }
+
+  function shoot(actor, actors, now, forcedSpread = null) {
+    const def = WEAPONS[weaponState.id];
+    if (!canFire(actor, now)) {
+      if (weaponState.mag <= 0 && weaponState.reload <= 0) startReload(actor);
+      return null;
+    }
+    weaponState.mag -= 1;
+    weaponState.cooldown = now + 60 / def.rpm;
+    const spread = forcedSpread ?? currentSpread(actor);
+
+    // recoil climbs a fixed ladder, then recentres: the pattern is learnable, like the games it nods to
+    const step = Math.min(recoilIndex, 9);
+    const vKick = def.recoil.v * (1 + step * 0.16);
+    const hKick = def.recoil.h * Math.sin(recoilIndex * 0.9) * (1 + step * 0.1);
+    viewPunch.x += vKick;
+    viewPunch.y += hKick;
+    actor.pitch = Math.min(PLAYER.maxPitch, actor.pitch + vKick * 0.55);
+    actor.yaw += hKick * 0.4;
+    recoilIndex += 1;
+
+    const result = combat.fire({ shooter: actor, weapon: def, actors, spread, isPlayer: true });
+    audio?.play(def.sound);
+    onShot?.(def);
+    hud?.muzzle(def);
+    if (result?.hit) hud?.hitmarker(result.killed);
+    if (weaponState.mag === 0) startReload(actor);
+    lastShotAt = now;
+    return result;
+  }
+
+  function update(dt, actor, actors, colliders, active) {
+    const now = performance.now() / 1000;
+    weaponState.cooldown = Math.max(0, weaponState.cooldown - dt);
+    if (weaponState.reload > 0) {
+      weaponState.reload -= dt;
+      if (weaponState.reload <= 0) {
+        const def = WEAPONS[weaponState.id];
+        const need = def.mag - weaponState.mag;
+        const take = Math.min(need, weaponState.reserve);
+        weaponState.mag += take;
+        weaponState.reserve -= take;
+        state.reloading = false;
+        hud?.setAmmo(weaponState.mag, weaponState.reserve, weaponState.reload > 0);
+      }
+    }
+
+    // recoil settles back towards the middle when the trigger is released
+    if (now - lastShotAt > 0.18) recoilIndex = Math.max(0, recoilIndex - dt * 26);
+    viewPunch.x += (0 - viewPunch.x) * Math.min(1, dt * 9);
+    viewPunch.y += (0 - viewPunch.y) * Math.min(1, dt * 9);
+
+    if (!actor.alive || !active) {
+      state.moving = 0;
+      applyCamera(actor);
+      return;
+    }
 
     const forward = (keys.has('KeyW') ? 1 : 0) - (keys.has('KeyS') ? 1 : 0);
     const strafe = (keys.has('KeyD') ? 1 : 0) - (keys.has('KeyA') ? 1 : 0);
-    wish.set(0, 0, 0);
-    if (forward || strafe) {
-      const sin = Math.sin(player.yaw);
-      const cos = Math.cos(player.yaw);
-      wish.set(-sin * forward + cos * strafe, 0, -cos * forward - sin * strafe).normalize();
+    const sneak = keys.has('ShiftLeft') || keys.has('ShiftRight');
+    const wantCrouch = keys.has('ControlLeft') || keys.has('ControlRight') || keys.has('KeyC');
+
+    actor.crouch = wantCrouch && actor.onGround;
+    const def = WEAPONS[weaponState.id];
+    const base = actor.crouch ? PLAYER.crouchSpeed : sneak ? PLAYER.sneakSpeed : PLAYER.walkSpeed;
+    const speedCap = base * def.speedMult;
+
+    const len = Math.hypot(forward, strafe) || 1;
+    const sin = Math.sin(state.yaw);
+    const cos = Math.cos(state.yaw);
+    const wishX = (-sin * forward + cos * strafe) / len;
+    const wishZ = (-cos * forward - sin * strafe) / len;
+    const wishLength = Math.hypot(forward, strafe) > 0 ? 1 : 0;
+
+    const accel = actor.onGround ? PLAYER.accel : PLAYER.accel * PLAYER.airControl;
+    actor.vx += wishX * wishLength * accel * dt;
+    actor.vz += wishZ * wishLength * accel * dt;
+
+    if (actor.onGround) {
+      const speed = Math.hypot(actor.vx, actor.vz);
+      const drop = speed * PLAYER.friction * dt;
+      const scale = Math.max(0, (speed - drop) / (speed || 1));
+      actor.vx *= scale;
+      actor.vz *= scale;
+      if (speed > speedCap) {
+        const k = speedCap / speed;
+        actor.vx *= k;
+        actor.vz *= k;
+      }
+    } else if (Math.hypot(actor.vx, actor.vz) > speedCap * 1.35) {
+      const s = Math.hypot(actor.vx, actor.vz);
+      const k = (speedCap * 1.35) / s;
+      actor.vx *= k;
+      actor.vz *= k;
     }
 
-    const speed = player.crouching ? CROUCH_SPEED : WALK_SPEED;
-    const blend = Math.min(1, (player.onGround ? GROUND_ACCEL : AIR_ACCEL) * dt / speed);
-    player.velocity.x += (wish.x * speed - player.velocity.x) * blend;
-    player.velocity.z += (wish.z * speed - player.velocity.z) * blend;
-    if (player.onGround && !wish.lengthSq()) {
-      const damp = Math.max(0, 1 - FRICTION * dt);
-      player.velocity.x *= damp;
-      player.velocity.z *= damp;
+    // jump
+    if ((keys.has('Space') || pressed.has('Space')) && actor.onGround) {
+      actor.vy = PLAYER.jumpSpeed;
+      actor.onGround = false;
+    }
+    actor.vy -= PLAYER.gravity * dt;
+    actor.y += actor.vy * dt;
+    if (actor.y <= 0) {
+      actor.y = 0;
+      actor.vy = 0;
+      actor.onGround = true;
     }
 
-    if (keys.has('Space') && player.onGround) {
-      player.velocity.y = JUMP_SPEED;
-      player.onGround = false;
-    }
-    player.velocity.y -= GRAVITY * dt;
+    const groundSpeed = moveActor(actor, actor.vx, actor.vz, dt, colliders, 1);
+    state.moving = Math.hypot(actor.vx, actor.vz) / PLAYER.walkSpeed;
+    if (actor.onGround && state.moving > 0.25) bob += dt * state.moving;
 
-    const nextX = player.position.x + player.velocity.x * dt;
-    if (!overlaps(nextX, player.position.y, player.position.z, player.height, 0.04)) player.position.x = nextX;
-    else player.velocity.x = 0;
-    const nextZ = player.position.z + player.velocity.z * dt;
-    if (!overlaps(player.position.x, player.position.y, nextZ, player.height, 0.04)) player.position.z = nextZ;
-    else player.velocity.z = 0;
+    actor.yaw = state.yaw;
+    actor.pitch = state.pitch;
+    updateActorMesh(actor, bob);
 
-    player.position.y += player.velocity.y * dt;
-    player.onGround = false;
-    const hit = overlaps(player.position.x, player.position.y, player.position.z, player.height, 0);
-    if (hit && player.velocity.y <= 0) {
-      player.position.y = hit.max.y;
-      player.velocity.y = 0;
-      player.onGround = true;
-    } else if (hit) {
-      player.position.y = hit.min.y - player.height;
-      player.velocity.y = 0;
+    applyCamera(actor);
+
+    if (mouseDown && active) {
+      const trigger = WEAPONS[weaponState.id].auto || pressed.has('Mouse0') || pressed.has('SemiAuto');
+      if (trigger) shoot(actor, actors, now);
     }
-    if (player.position.y < 0) {
-      player.position.y = 0;
-      player.velocity.y = 0;
-      player.onGround = true;
-    }
-    player.velocity.y = Math.max(-30, player.velocity.y);
+    pressed.clear();
+  }
+
+  // the camera follows the eye every frame, including when the body is frozen (buy phase, death)
+  function applyCamera(actor) {
+    const eye = actor.crouch ? PLAYER.crouchEyeHeight : PLAYER.eyeHeight;
+    const bobAmount = actor.onGround ? Math.sin(bob * 9) * 0.022 * state.moving : 0;
+    shake = Math.max(0, shake - 0.016 * 2.4);
+    const shakeX = (Math.random() - 0.5) * shake * 0.02;
+    const shakeY = (Math.random() - 0.5) * shake * 0.02;
+    camera.position.set(actor.x + shakeX, actor.y + eye + bobAmount + shakeY, actor.z);
+    camera.rotation.order = 'YXZ';
+    camera.rotation.y = state.yaw + viewPunch.y;
+    camera.rotation.x = Math.max(-PLAYER.maxPitch, Math.min(PLAYER.maxPitch, state.pitch + viewPunch.x));
+    camera.rotation.z = Math.sin(bob * 4.5) * 0.006 * state.moving;
+  }
+
+  function onMouseMove(dx, dy, sensitivity = PLAYER.mouseSensitivity) {
+    state.yaw -= dx * sensitivity;
+    state.pitch = Math.max(-PLAYER.maxPitch, Math.min(PLAYER.maxPitch, state.pitch - dy * sensitivity));
+  }
+
+  function damageShake(amount) {
+    shake = Math.min(1, shake + amount * 0.02);
   }
 
   return {
-    state: player,
-    step,
-    look,
-    recoil,
-    groundSpeed() {
-      return Math.hypot(player.velocity.x, player.velocity.z);
-    },
+    state,
+    keys,
+    pressed,
+    onMouseMove,
+    shoot,
+    startReload,
+    switchWeapon,
+    resetWeapon,
+    addAmmo,
+    damageShake,
+    update,
+    get weapon() { return weaponState; },
+    setMouseDown(v) { mouseDown = v; },
+    getMouseDown() { return mouseDown; },
+    toggleScope() { scoped = !scoped; hud?.setScope(scoped); },
   };
 }

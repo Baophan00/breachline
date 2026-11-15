@@ -1,217 +1,270 @@
-// Boot and the one loop: a fixed 60 Hz simulation feeding a render at the display's rate.
-// ?shot=start|play|end with &seed=N sets up a deterministic frame for a capture, renders it
-// twice, then freezes it and sets window.__shotReady.
+// Breachline boots here: renderer, world, the ten actors of a match, and the loop that ties the
+// round clock to the bots, the player and the HUD. `?shot=` renders a deterministic frame for a
+// screenshot and sets window.__shotReady when it is on screen.
 import * as THREE from 'three';
-import { PALETTE } from './palette.js';
+import { ROUND, PLAYER, WEAPONS, ECONOMY } from './config.js';
 import { createWorld } from './world.js';
-import { createInput } from './input.js';
+import { createNav } from './nav.js';
+import { createActor, placeActor } from './actor.js';
+import { createCombat } from './combat.js';
 import { createPlayer } from './player.js';
-import { createWeapon } from './weapon.js';
-import { createTargets } from './targets.js';
+import { createBots } from './bots.js';
+import { createRound } from './round.js';
 import { createHud } from './hud.js';
+import { createAudio } from './audio.js';
+import { createInput } from './input.js';
+import { createViewmodel } from './viewmodel.js';
 
-const FIXED_STEP = 1 / 60;
-const params = new URLSearchParams(window.location.search);
-const shot = params.get('shot');
-const seed = Number.parseInt(params.get('seed') ?? '1', 10) || 1;
+const params = new URLSearchParams(location.search);
+const shotMode = params.get('shot');
+const seed = Number(params.get('seed') ?? 1);
 
-function mulberry32(initial) {
-  let a = initial;
-  return function random() {
-    a |= 0;
-    a = (a + 0x6d2b79f5) | 0;
-    let t = Math.imul(a ^ (a >>> 15), 1 | a);
-    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
-    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
-  };
-}
-const random = mulberry32(seed);
-
+const container = document.getElementById('game');
 const renderer = new THREE.WebGLRenderer({ antialias: true, powerPreference: 'high-performance' });
-renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+renderer.setPixelRatio(Math.min(window.devicePixelRatio, 1.75));
 renderer.setSize(window.innerWidth, window.innerHeight);
 renderer.shadowMap.enabled = true;
 renderer.shadowMap.type = THREE.PCFSoftShadowMap;
-document.getElementById('game').appendChild(renderer.domElement);
+renderer.toneMapping = THREE.ACESFilmicToneMapping;
+renderer.toneMappingExposure = 1.16;
+container.appendChild(renderer.domElement);
 
 const scene = new THREE.Scene();
-scene.background = new THREE.Color(PALETTE.canvas);
-scene.fog = new THREE.Fog(new THREE.Color(PALETTE.canvas), 18, 46);
-const camera = new THREE.PerspectiveCamera(74, window.innerWidth / window.innerHeight, 0.05, 140);
-scene.add(camera);
+const camera = new THREE.PerspectiveCamera(78, window.innerWidth / window.innerHeight, 0.05, 220);
 
 const world = createWorld(scene);
-const targets = createTargets(scene);
-const weapon = createWeapon(camera);
-const hud = createHud();
-const player = createPlayer(world.colliders);
-const input = createInput(renderer.domElement, onLockChange);
-const raycaster = new THREE.Raycaster();
-raycaster.far = 80;
-const shootables = world.shootables.concat(targets.hitMeshes);
-const direction = new THREE.Vector3();
+const nav = createNav(world.colliders);
+const audio = createAudio();
 
-const body = player.state;
-const markerHoldMs = shot ? 4000 : 90;
-let score = 0;
-let elapsed = 0;
-let cleared = false;
-let frozen = false;
-let started = false;
-let accumulator = 0;
-let lastTime = performance.now();
+const playerActor = createActor({ id: 'player', name: 'Rook', team: 't', isPlayer: true, x: 0, z: 25, yaw: Math.PI });
+scene.add(playerActor.mesh);
+playerActor.mesh.visible = false;
 
-hud.setAmmo(weapon.state.mag, weapon.state.reserve);
-hud.setScore(0);
-hud.onPlay(() => {
-  if (shot) return;
-  if (cleared) restart();
-  input.requestLock();
+let actors = [playerActor];
+
+const combat = createCombat({
+  scene,
+  world,
+  onDamage(victim, shooter, amount, part) {
+    if (victim.isPlayer) {
+      hud.flashDamage(amount);
+      controller.damageShake(amount);
+    }
+  },
+  onKill(victim, shooter, weapon, part) {
+    round.onKill(victim, shooter, weapon, part);
+    if (shooter?.isPlayer) audio.play('killed');
+  },
 });
 
-function restart() {
-  cleared = false;
-  score = 0;
-  elapsed = 0;
-  targets.reset();
-  weapon.refill();
-  hud.setScore(0);
-  hud.setAmmo(weapon.state.mag, weapon.state.reserve);
+const hud = createHud({
+  nav,
+  world,
+  onBuy(item) { buyForPlayer(item); },
+});
+
+const viewmodel = createViewmodel({ camera, scene });
+const controller = createPlayer({
+  camera, combat, audio, hud,
+  onShot: (def) => viewmodel.fire(def.type === 'shotgun' ? 1.7 : def.type === 'rifle' ? 1.1 : 0.9),
+  onReload: (def) => viewmodel.startReload(def),
+  onSwitch: (def) => viewmodel.mount(def.type),
+});
+hud.setWeapon(WEAPONS.sidearm);
+const bots = createBots({ scene, nav, combat, world, audio });
+actors = [playerActor, ...bots.bots];
+
+for (const bot of bots.bots) scene.add(bot.mesh);
+
+const round = createRound({ world, scene, actors, hud, audio, combat, player: controller });
+
+// --- buying -------------------------------------------------------------------------------
+function grantWeapon(id) {
+  playerActor.ownedWeapons = playerActor.ownedWeapons ?? new Set(['sidearm']);
+  playerActor.ownedWeapons.add(id);
+  controller.resetWeapon(id);
 }
 
-function onLockChange(locked) {
-  if (shot) return;
-  if (locked) {
-    started = true;
-    hud.hideOverlay();
-  } else if (!cleared) {
-    hud.showOverlay(started ? 'paused' : 'start', score);
-  }
-}
-
-function syncCamera() {
-  camera.position.set(body.position.x, body.position.y + body.eye, body.position.z);
-  camera.rotation.set(body.pitch, body.yaw, 0, 'YXZ');
-}
-
-function aimAt(point) {
-  const dx = point.x - body.position.x;
-  const dy = point.y - (body.position.y + body.eye);
-  const dz = point.z - body.position.z;
-  const length = Math.hypot(dx, dy, dz) || 1;
-  body.yaw = Math.atan2(-dx, -dz);
-  body.pitch = Math.asin(Math.max(-1, Math.min(1, dy / length)));
-  syncCamera();
-}
-
-function shoot(spread) {
-  if (!weapon.takeRound()) return false;
-  camera.getWorldDirection(direction);
-  direction.x += (random() * 2 - 1) * spread;
-  direction.y += (random() * 2 - 1) * spread;
-  direction.z += (random() * 2 - 1) * spread;
-  direction.normalize();
-  scene.updateMatrixWorld(true);
-  raycaster.set(camera.position, direction);
-  const hit = raycaster.intersectObjects(shootables, false)[0];
-  if (hit && hit.object.userData.target) {
-    const killed = targets.damage(hit.object, hit.object.userData.part === 'head' ? 100 : 34);
-    score += killed ? 100 : 10;
-    hud.setScore(score);
-    hud.hitMarker(killed, markerHoldMs);
-    if (targets.remaining() === 0 && !cleared) {
-      cleared = true;
-      hud.showOverlay('end', score);
-      if (document.pointerLockElement) document.exitPointerLock();
+function buyForPlayer(item) {
+  if (round.state.phase !== 'buy') return;
+  if (playerActor.money < item.price) return;
+  if (item.kind === 'weapon') {
+    if (playerActor.ownedWeapons?.has(item.id) && controller.weapon.id === item.id) return;
+    playerActor.money -= item.price;
+    grantWeapon(item.id);
+  } else if (item.kind === 'armor') {
+    if (item.id === 'helmet') {
+      if (playerActor.helmet) return;
+      playerActor.money -= item.price;
+      playerActor.helmet = true;
+      playerActor.armor = 100;
+    } else {
+      if (playerActor.armor >= 100) return;
+      playerActor.money -= item.price;
+      playerActor.armor = 100;
     }
+  } else if (item.kind === 'ammo') {
+    playerActor.money -= item.price;
+    controller.addAmmo();
   }
-  weapon.pullTrigger();
-  player.recoil(0.009 + random() * 0.004, (random() * 2 - 1) * 0.004);
-  hud.setAmmo(weapon.state.mag, weapon.state.reserve);
-  return true;
+  audio.play('buy');
+  hud.refreshBuy(playerActor);
 }
+
+// --- input ---------------------------------------------------------------------------------
+const input = createInput({
+  canvas: renderer.domElement,
+  onKey(code, { first }) {
+    // the controller keeps its own key set: the input module feeds it, and the HUD keys stay here
+    if (first) controller.keys.add(code);
+    else controller.keys.delete(code);
+    if (!first) return;
+    if (code === 'KeyR') controller.startReload(playerActor);
+    if (code === 'Digit1') controller.switchWeapon(playerActor, 1);
+    if (code === 'Digit2') controller.switchWeapon(playerActor, 2);
+    if (code === 'Digit3') controller.switchWeapon(playerActor, 3);
+    if (code === 'KeyB') toggleBuy();
+    if (code === 'Tab') hud.setScoreboardOpen(true, actors);
+  },
+  onMouseMove(dx, dy) {
+    if (state.paused) return;
+    controller.onMouseMove(dx, dy);
+  },
+  onMouseDown() {
+    if (state.paused) return;
+    controller.setMouseDown(true);
+    controller.pressed.add('Mouse0');
+  },
+  onMouseUp() {
+    controller.setMouseDown(false);
+  },
+  onLockChange(locked) {
+    if (!locked && state.running && !state.paused) pause();
+  },
+});
+
+window.addEventListener('keyup', (event) => {
+  if (event.code === 'Tab') hud.setScoreboardOpen(false, actors);
+});
+
+function toggleBuy() {
+  if (round.state.phase !== 'buy') return;
+  const open = !hud.getBuyOpen();
+  hud.setBuyOpen(open, playerActor, round.state.timer);
+  if (open) input.exitLock(); else input.requestLock();
+}
+
+// --- match states ---------------------------------------------------------------------------
+const state = { running: false, paused: false, over: false, time: 0 };
+
+function startMatch() {
+  document.getElementById('overlay').hidden = true;
+  state.running = true;
+  state.paused = false;
+  state.over = false;
+  controller.resetWeapon('sidearm');
+  playerActor.ownedWeapons = new Set(['sidearm']);
+  playerActor.armor = 0;
+  playerActor.helmet = false;
+  playerActor.money = ECONOMY.start;
+  placeActor(playerActor, world.spawns.t[1]);
+  round.startMatch();
+  hud.setTeamText('raiders · you are Rook');
+  audio.resume();
+  input.requestLock();
+  hud.setBuyOpen(true, playerActor, ROUND.buySeconds);
+}
+
+function pause() {
+  state.paused = true;
+  input.exitLock();
+  const overlay = document.getElementById('overlay');
+  overlay.hidden = false;
+  const title = overlay.querySelector('h1');
+  const copy = overlay.querySelector('p');
+  const button = document.getElementById('play');
+  title.innerHTML = 'Paused';
+  copy.textContent = 'Click to lock the mouse and go back to the round.';
+  button.textContent = 'Resume';
+  button.onclick = () => {
+    overlay.hidden = true;
+    state.paused = false;
+    input.requestLock();
+  };
+}
+
+document.getElementById('play').addEventListener('click', () => {
+  if (state.paused) return;
+  if (state.over) {
+    location.reload();
+    return;
+  }
+  startMatch();
+});
+
+// --- loop -----------------------------------------------------------------------------------
+let last = performance.now();
+const fixed = 1 / 60;
 
 function step(dt) {
-  elapsed += dt;
-  player.step(dt, input.state.keys);
-  weapon.step(dt);
-  targets.step(dt, elapsed);
+  const now = performance.now() / 1000;
+  audio.setListener(playerActor.x, playerActor.z);
+  round.update(dt);
+  bots.update(dt, { actors, round, player: playerActor });
+  controller.update(dt, playerActor, actors, world.colliders, state.running && !state.paused && !state.over);
+
+  // plant and defuse on E
+  if (state.running && playerActor.alive && !state.paused) {
+    const holding = input.keys.has('KeyE');
+    if (holding && round.canPlant(playerActor)) {
+      round.beginPlant(playerActor, dt);
+    } else if (holding && round.bombPlanted && playerActor.team === 'ct' && round.inSite(playerActor)) {
+      round.beginDefuse(playerActor, dt);
+    } else if (holding && playerActor.team === 'ct' && round.bombPlanted) {
+      const d = Math.hypot(playerActor.x - round.bomb.x, playerActor.z - round.bomb.z);
+      if (d < 2.2) round.beginDefuse(playerActor, dt);
+    }
+  }
+
+  if (!playerActor.alive && state.running && !state.over) {
+    // a dead player watches the rest of the round from above
+    camera.position.y = Math.max(camera.position.y, 8);
+    camera.lookAt(0, 0, 0);
+  }
+
+  viewmodel.update(dt, {
+    moving: controller.state.moving,
+    crouch: playerActor.crouch,
+    pitch: controller.state.pitch,
+    alive: playerActor.alive && state.running && !state.paused && !hud.getBuyOpen(),
+  });
+  hud.update(dt, actors, playerActor);
+  playerActor.mag = controller.weapon.mag;
+  hud.setVitals(playerActor);
+  hud.setAmmo(controller.weapon.mag, controller.weapon.reserve, controller.weapon.reload > 0);
+  combat.updateEffects(dt);
+  if (hud.getBuyOpen()) hud.nodes.buytimer.textContent = String(Math.max(0, Math.ceil(round.state.timer)));
+  if (state.running && !state.paused && round.state.phase === 'live' && hud.getBuyOpen()) {
+    hud.setBuyOpen(false, playerActor, 0);
+    input.requestLock();
+  }
 }
 
-function frame(now) {
-  requestAnimationFrame(frame);
-  const dt = Math.min((now - lastTime) / 1000, 0.1);
-  lastTime = now;
-  if (!frozen) {
-    const look = input.takeLook();
-    player.look(look.x, look.y);
-    if (input.state.firing && weapon.ready()) shoot(shot ? 0 : weapon.spread(player.groundSpeed()));
-    if (input.state.keys.has('KeyR')) weapon.reload();
-    accumulator += dt;
-    let steps = 0;
-    while (accumulator >= FIXED_STEP && steps < 5) {
-      step(FIXED_STEP);
-      accumulator -= FIXED_STEP;
-      steps += 1;
-    }
-    if (accumulator > FIXED_STEP * 5) accumulator = 0;
-    syncCamera();
+function animate() {
+  requestAnimationFrame(animate);
+  const now = performance.now();
+  let dt = (now - last) / 1000;
+  last = now;
+  dt = Math.min(dt, 0.05);
+  state.time += dt;
+  if (state.running && !state.paused) step(dt);
+  else if (!state.running) {
+    // menu: let the camera drift over the map so the title screen is alive
+    camera.position.set(Math.sin(state.time * 0.12) * 16, 12 + Math.sin(state.time * 0.2) * 1.2, 24 + Math.cos(state.time * 0.12) * 8);
+    camera.lookAt(0, 1, 0);
+    combat.updateEffects(dt);
   }
   renderer.render(scene, camera);
-}
-
-function settle(steps) {
-  for (let index = 0; index < steps; index += 1) step(FIXED_STEP);
-}
-
-function runShot(name) {
-  hud.hideOverlay();
-  body.pitch = 0;
-  body.yaw = 0;
-  if (name === 'play' || name === 'end') {
-    body.position.set(0, 0, -5);
-    settle(20);
-    const count = name === 'play' ? 1 : targets.items.length;
-    for (let index = 0; index < count; index += 1) {
-      const point = targets.aimPoint(index);
-      for (let round = 0; round < 3; round += 1) {
-        aimAt(point);
-        shoot(0);
-        if (round < 2) settle(8);
-      }
-    }
-    if (name === 'play') {
-      settle(12);
-      aimAt(targets.aimPoint(1));
-      shoot(0);
-      settle(1);
-    } else {
-      settle(40);
-    }
-  } else {
-    body.position.set(0.6, 0, 8.6);
-    settle(20);
-    aimAt(new THREE.Vector3(0, 1.5, -6));
-    hud.showOverlay('start', 0);
-  }
-  hud.setScore(score);
-  hud.setAmmo(weapon.state.mag, weapon.state.reserve);
-  paintTwiceThenReady();
-}
-
-function paintTwiceThenReady() {
-  let painted = 0;
-  function paint() {
-    requestAnimationFrame(paint);
-    syncCamera();
-    renderer.render(scene, camera);
-    painted += 1;
-    if (painted === 2) {
-      window.__shotReady = true;
-      frozen = true;
-    }
-  }
-  requestAnimationFrame(paint);
 }
 
 window.addEventListener('resize', () => {
@@ -220,6 +273,124 @@ window.addEventListener('resize', () => {
   renderer.setSize(window.innerWidth, window.innerHeight);
 });
 
-syncCamera();
-if (shot) runShot(shot);
-else requestAnimationFrame(frame);
+// --- deterministic screenshot frames ----------------------------------------------------------
+function runShot(kind) {
+  document.getElementById('overlay').hidden = true;
+  document.getElementById('buy').hidden = true;
+  state.running = true;
+
+  // a small deterministic rng so a seed always frames the same fight
+  let s = seed * 9301 + 49297;
+  Math.random = () => {
+    s = (s * 9301 + 49297) % 233280;
+    return s / 233280;
+  };
+
+  round.startMatch();
+  if (kind === 'menu') {
+    document.getElementById('overlay').hidden = false;
+    document.getElementById('hud').style.display = 'none';
+    state.running = false;
+  }
+
+  if (kind === 'play' || kind === 'end' || kind === 'plant') {
+    playerActor.ownedWeapons = new Set(['sidearm', 'rifle']);
+    playerActor.armor = 100;
+    playerActor.helmet = true;
+    controller.resetWeapon('rifle');
+    playerActor.money = 4250;
+
+    // burn the round clock so the bots are out of spawn and mid is contested
+    const frames = kind === 'play' ? 60 * 16 : 60 * 22;
+    for (let i = 0; i < frames; i += 1) step(fixed);
+
+    if (kind === 'plant' || kind === 'end') {
+      round.placeBomb(world.sites.a.x - 1.2, world.sites.a.z + 1.4);
+      round.state.timer = 26;
+      hud.bombPlanted(true);
+    }
+    if (kind === 'end') {
+      round.state.score.t = 6;
+      round.state.score.ct = 4;
+      hud.roundOver('t', 'wardens eliminated', round.state);
+    }
+
+    // stand where the round is actually being fought: pick the enemy nearest the middle of the
+    // map, back off along a clear line, and face it
+    if (kind === 'play') {
+      const enemies = actors.filter((a) => a.alive && a.team !== playerActor.team);
+      const target = enemies.sort((a, b) => Math.abs(a.x) - Math.abs(b.x))[0] ?? { x: 0, z: 0 };
+      const candidates = [
+        { x: target.x, z: target.z + 7.5 },
+        { x: target.x + 7.5, z: target.z },
+        { x: target.x, z: target.z - 7.5 },
+        { x: target.x - 7.5, z: target.z },
+      ];
+      const spot = candidates.find((c) => {
+        const blocked = world.colliders.some((b) => c.x + 0.6 > b.minX && c.x - 0.6 < b.maxX && c.z + 0.6 > b.minZ && c.z - 0.6 < b.maxZ);
+        return !blocked && nav.clearLine(c.x, c.z, target.x, target.z);
+      }) ?? candidates[0];
+      playerActor.x = spot.x;
+      playerActor.z = spot.z;
+      controller.state.yaw = Math.atan2(-(target.x - spot.x), -(target.z - spot.z));
+      playerActor.targetBot = target;
+    } else {
+      // inside site A, a couple of metres off the charge, looking down at it
+      playerActor.x = 19.6;
+      playerActor.z = 9.4;
+      controller.state.yaw = 0.12;
+      controller.state.pitch = -0.16;
+
+      // a warden working the defuse, so the frame shows the objective under pressure
+      const warden = actors.find((a) => a.team === 'ct' && a.alive);
+      if (warden) {
+        warden.x = world.sites.a.x - 1.2;
+        warden.z = world.sites.a.z + 2.6;
+        warden.y = 0;
+        warden.crouch = true;
+        warden.yaw = Math.atan2(-1.2, 2.0);
+        warden.pitch = -0.5;
+        warden.mesh.visible = true;
+        warden.mesh.position.set(warden.x, -0.34, warden.z);
+        warden.mesh.rotation.y = warden.yaw;
+      }
+    }
+    if (kind === 'play') controller.state.pitch = -0.02;
+    playerActor.alive = true;
+    playerActor.health = 92;
+    playerActor.yaw = controller.state.yaw;
+    playerActor.pitch = controller.state.pitch;
+    controller.update(fixed, playerActor, actors, world.colliders, false);
+    viewmodel.mount('rifle');
+    viewmodel.update(fixed, { moving: 0.2, crouch: false, pitch: controller.state.pitch, alive: true });
+    hud.setWeapon(WEAPONS.rifle);
+
+    // fire once at the target so the frame holds a real tracer and muzzle flash
+    if (kind === 'play' && playerActor.targetBot) {
+      scene.updateMatrixWorld(true);
+      const enemy = playerActor.targetBot;
+      controller.state.pitch = Math.atan2(1.42 - 1.62, Math.hypot(enemy.x - playerActor.x, enemy.z - playerActor.z));
+      playerActor.pitch = controller.state.pitch;
+      playerActor.yaw = controller.state.yaw;
+      controller.shoot(playerActor, actors, performance.now() / 1000, 0.001);
+      viewmodel.fire(1);
+      viewmodel.update(0.008, { moving: 0.2, crouch: false, pitch: controller.state.pitch, alive: true });
+    }
+    hud.setAmmo(controller.weapon.mag, controller.weapon.reserve, false);
+  }
+
+  renderer.render(scene, camera);
+  requestAnimationFrame(() => {
+    renderer.render(scene, camera);
+    window.__shotReady = true;
+  });
+}
+
+window.__dbg = { camera, scene, world, player: playerActor, round, bots, controller, renderer, viewmodel, startMatch, step, actors, hud, input };
+
+if (shotMode) {
+  runShot(shotMode);
+} else {
+  animate();
+  window.__breachlineReady = true;
+}
